@@ -34,3 +34,7 @@ node_modules/
 # Misc
 dist/
 coverage/
+
+# Temporary specification files (keep drafts out of the repo)
+ORBIT_Especificacion_Tecnica.md
+ORBIT_Technical_Specification.md
