@@ -1,5 +1,6 @@
 pub mod dnf;
 
+use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::models::{
@@ -34,6 +35,7 @@ pub enum AdapterError {
     Other(#[from] anyhow::Error),
 }
 
+#[async_trait]
 pub trait PackageAdapter: Send + Sync {
     fn backend_id(&self) -> &'static str;
     fn is_available(&self) -> bool;

@@ -83,8 +83,10 @@ CREATE TABLE IF NOT EXISTS history (
 );
 ";
 
+use crate::models::AppFootprint;
+
 pub struct Database {
-    conn: Connection,
+    conn: std::sync::Mutex<Connection>,
 }
 
 impl Database {
@@ -96,7 +98,9 @@ impl Database {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn: std::sync::Mutex::new(conn),
+        })
     }
 
     pub fn default_path() -> anyhow::Result<std::path::PathBuf> {
@@ -107,7 +111,120 @@ impl Database {
         Ok(base.join("orbit.db"))
     }
 
-    pub fn conn(&self) -> &Connection {
-        &self.conn
+    pub fn upsert_apps(&self, apps: &[AppFootprint]) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO apps (id, display_name, source, version, architecture, scope,
+             package_size, config_size, cache_size, data_size, shared_size, total_footprint,
+             is_orphan_candidate, summary, description, homepage, license, installed_at,
+             discovered_at, last_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+             ON CONFLICT(id) DO UPDATE SET
+             display_name=excluded.display_name, version=excluded.version,
+             architecture=excluded.architecture, package_size=excluded.package_size,
+             total_footprint=excluded.total_footprint, summary=excluded.summary,
+             last_updated=excluded.last_updated",
+        )?;
+
+        for app in apps {
+            let source_str = match app.source {
+                crate::models::PackageSource::Apt => "apt",
+                crate::models::PackageSource::Rpm => "rpm",
+                crate::models::PackageSource::Flatpak => "flatpak",
+                crate::models::PackageSource::Snap => "snap",
+                crate::models::PackageSource::Loose => "loose",
+                crate::models::PackageSource::Unknown => "unknown",
+            };
+
+            let scope_str = match app.scope {
+                crate::models::InstallScope::System => "system",
+                crate::models::InstallScope::User => "user",
+            };
+
+            stmt.execute(rusqlite::params![
+                app.id,
+                app.display_name,
+                source_str,
+                app.version,
+                app.architecture,
+                scope_str,
+                app.size_bytes.package_size,
+                app.size_bytes.config_size,
+                app.size_bytes.cache_size,
+                app.size_bytes.data_size,
+                app.size_bytes.shared_size,
+                app.size_bytes.total_footprint,
+                app.is_orphan_candidate as i32,
+                app.summary,
+                app.description,
+                app.homepage,
+                app.license,
+                app.installed_at.map(|t| t.timestamp()),
+                now,
+                now,
+            ])?;
+        }
+
+        Ok(())
+    }
+
+    pub fn get_all_apps(&self) -> anyhow::Result<Vec<AppFootprint>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, display_name, source, version, architecture, scope,
+             package_size, config_size, cache_size, data_size, shared_size, total_footprint,
+             is_orphan_candidate, summary, description, homepage, license, installed_at
+             FROM apps ORDER BY display_name",
+        )?;
+
+        let apps = stmt.query_map([], |row| {
+            let source_str: String = row.get(2)?;
+            let scope_str: String = row.get(5)?;
+
+            Ok(AppFootprint {
+                id: row.get(0)?,
+                display_name: row.get(1)?,
+                source: Self::parse_source(&source_str),
+                version: row.get(3)?,
+                architecture: row.get(4)?,
+                scope: if scope_str == "user" {
+                    crate::models::InstallScope::User
+                } else {
+                    crate::models::InstallScope::System
+                },
+                size_bytes: crate::models::SizeBreakdown {
+                    package_size: row.get(6)?,
+                    config_size: row.get(7)?,
+                    cache_size: row.get(8)?,
+                    data_size: row.get(9)?,
+                    shared_size: row.get(10)?,
+                    total_footprint: row.get(11)?,
+                },
+                is_orphan_candidate: row.get::<_, i32>(12)? != 0,
+                summary: row.get(13)?,
+                description: row.get(14)?,
+                homepage: row.get(15)?,
+                license: row.get(16)?,
+                installed_at: row
+                    .get::<_, Option<i64>>(17)?
+                    .and_then(|ts| chrono::TimeZone::timestamp_opt(&chrono::Utc, ts, 0).single()),
+                ..Default::default()
+            })
+        })?;
+
+        apps.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn parse_source(s: &str) -> crate::models::PackageSource {
+        match s {
+            "apt" => crate::models::PackageSource::Apt,
+            "rpm" => crate::models::PackageSource::Rpm,
+            "flatpak" => crate::models::PackageSource::Flatpak,
+            "snap" => crate::models::PackageSource::Snap,
+            "loose" => crate::models::PackageSource::Loose,
+            _ => crate::models::PackageSource::Unknown,
+        }
     }
 }

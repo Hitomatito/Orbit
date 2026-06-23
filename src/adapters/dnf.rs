@@ -2,6 +2,8 @@ use chrono::{TimeZone, Utc};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
+use async_trait::async_trait;
+
 use crate::adapters::{AdapterError, PackageAdapter};
 use crate::models::{
     AppFootprint, DependencyInfo, DependencyType, InstallScope, IntegrityStatus, PackageSource,
@@ -26,6 +28,7 @@ impl DnfAdapter {
     }
 }
 
+#[async_trait]
 impl PackageAdapter for DnfAdapter {
     fn backend_id(&self) -> &'static str {
         "rpm"

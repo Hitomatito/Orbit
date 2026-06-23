@@ -1,21 +1,29 @@
+use std::sync::Arc;
+
 use adw::prelude::*;
 
+use crate::db::Database;
 use crate::rt::AsyncRuntime;
 
 pub struct OrbitApp {
     app: adw::Application,
     _rt: AsyncRuntime,
+    _db: Arc<Database>,
 }
 
 impl OrbitApp {
-    pub fn new(rt: AsyncRuntime) -> Self {
+    pub fn new(rt: AsyncRuntime, db: Arc<Database>) -> Self {
         let app = adw::Application::builder()
             .application_id("com.orbit.AppManager")
             .build();
 
         app.connect_activate(Self::build_ui);
 
-        Self { app, _rt: rt }
+        Self {
+            app,
+            _rt: rt,
+            _db: db,
+        }
     }
 
     pub fn run(&self) {
