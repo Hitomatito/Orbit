@@ -26,3 +26,8 @@ async-trait = "0.1"
 dirs = "6.0"
 thiserror = "2.0"
 zbus = "5.0"
+
+[lib]
+name = "orbit"
+path = "src/lib.rs"
+
