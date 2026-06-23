@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use chrono::{TimeZone, Utc};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +28,67 @@ impl DnfAdapter {
         let stdout = String::from_utf8_lossy(&output.stdout);
         Ok(stdout.lines().map(|l| l.to_string()).collect())
     }
+
+    /// Query per-file sizes from RPM and sum them by category.
+    /// Uses RPM's array format: `[%{FILENAMES}\t%{FILESIZES}\n]`
+    async fn detailed_footprint(pkg: &str) -> Result<SizeBreakdown, AdapterError> {
+        let lines = Self::rpm_output(&[
+            "-q",
+            "--qf",
+            "[%{FILENAMES}\t%{FILESIZES}\n]",
+            pkg,
+        ])
+        .await?;
+
+        let mut total: u64 = 0;
+        let mut config: u64 = 0;
+        let mut cache: u64 = 0;
+        let mut data: u64 = 0;
+        let mut shared: u64 = 0;
+
+        for line in &lines {
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split('\t');
+            let path = match parts.next() {
+                Some(p) => p,
+                None => continue,
+            };
+            let size: u64 = parts
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            total += size;
+
+            let p = Path::new(path);
+            let first = p.components().nth(0).map(|c| c.as_os_str().to_string_lossy().to_string());
+
+            match first.as_deref() {
+                Some("etc") => config += size,
+                Some("var") if path.starts_with("/var/cache/") => cache += size,
+                Some("usr") if path.starts_with("/usr/share/")
+                    || path.starts_with("/usr/local/share/") => data += size,
+                Some("var") if path.starts_with("/var/lib/")
+                    || path.starts_with("/var/opt/") => data += size,
+                Some("opt") => data += size,
+                Some("usr") if path.starts_with("/usr/lib/")
+                    || path.starts_with("/usr/lib64/")
+                    || path.starts_with("/usr/libexec/") => shared += size,
+                _ => {}
+            }
+        }
+
+        Ok(SizeBreakdown {
+            package_size: 0,
+            config_size: config,
+            cache_size: cache,
+            data_size: data,
+            shared_size: shared,
+            total_footprint: total,
+        })
+    }
 }
 
 #[async_trait]
@@ -48,7 +111,7 @@ impl PackageAdapter for DnfAdapter {
         let lines = Self::rpm_output(&[
             "-qa",
             "--queryformat",
-            "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\t%{SIZE}\t%{INSTALLTIME}\t%{SUMMARY}\n",
+            "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\t%{SIZE}\t%{ARCHIVESIZE}\t%{INSTALLTIME}\t%{SUMMARY}\n",
         ])
         .await?;
 
@@ -69,7 +132,8 @@ impl PackageAdapter for DnfAdapter {
             };
             let version = parts.next().unwrap_or("").to_string();
             let _arch = parts.next().unwrap_or("").to_string();
-            let size: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let installed_size: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let archive_size: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             let install_ts: Option<i64> = parts.next().and_then(|s| s.parse().ok());
             let summary = parts.next().unwrap_or("").to_string();
 
@@ -81,8 +145,8 @@ impl PackageAdapter for DnfAdapter {
                 architecture: _arch,
                 scope: InstallScope::System,
                 size_bytes: SizeBreakdown {
-                    package_size: size,
-                    total_footprint: size,
+                    package_size: archive_size,
+                    total_footprint: installed_size,
                     ..Default::default()
                 },
                 summary,
@@ -100,7 +164,7 @@ impl PackageAdapter for DnfAdapter {
         let info_lines = Self::rpm_output(&[
             "-q",
             "--queryformat",
-            "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\t%{SIZE}\t%{INSTALLTIME}\t%{SUMMARY}\t%{URL}\t%{LICENSE}\n",
+            "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\t%{SIZE}\t%{ARCHIVESIZE}\t%{INSTALLTIME}\t%{SUMMARY}\t%{URL}\t%{LICENSE}\n",
             pkg,
         ])
         .await?;
@@ -109,7 +173,7 @@ impl PackageAdapter for DnfAdapter {
             .first()
             .ok_or_else(|| AdapterError::AppNotFound(pkg.to_string()))?;
 
-        let parts: Vec<&str> = info.splitn(8, '\t').collect();
+        let parts: Vec<&str> = info.splitn(9, '\t').collect();
         if parts.len() < 6 {
             return Err(AdapterError::Parse("unexpected rpm info format".into()));
         }
@@ -117,14 +181,29 @@ impl PackageAdapter for DnfAdapter {
         let name = parts[0].to_string();
         let version = parts[1].to_string();
         let arch = parts[2].to_string();
-        let size: u64 = parts[3].parse().unwrap_or(0);
-        let install_ts: Option<i64> = parts[4].parse().ok();
-        let summary = parts.get(5).unwrap_or(&"").to_string();
-        let homepage = parts.get(6).filter(|s| !s.is_empty()).map(|s| s.to_string());
-        let license = parts.get(7).filter(|s| !s.is_empty()).map(|s| s.to_string());
+        let installed_size: u64 = parts[3].parse().unwrap_or(0);
+        let archive_size: u64 = parts[4].parse().unwrap_or(0);
+        let install_ts: Option<i64> = parts[5].parse().ok();
+        let summary = parts.get(6).unwrap_or(&"").to_string();
+        let homepage = parts.get(7).filter(|s| !s.is_empty()).map(|s| s.to_string());
+        let license = parts.get(8).filter(|s| !s.is_empty()).map(|s| s.to_string());
 
         let files = self.list_files(app_id).await?;
         let configs = self.list_declared_configs(app_id).await?;
+
+        // Detailed per-file size breakdown, categorized by path prefix
+        let mut size_bytes = Self::detailed_footprint(pkg).await.unwrap_or_else(|_| {
+            SizeBreakdown {
+                package_size: archive_size,
+                total_footprint: installed_size,
+                ..Default::default()
+            }
+        });
+        size_bytes.package_size = archive_size;
+        // Use RPM's total if our sum is smaller (e.g. missing perms on some files)
+        if size_bytes.total_footprint < installed_size {
+            size_bytes.total_footprint = installed_size;
+        }
 
         Ok(AppFootprint {
             id: format!("rpm:{}", &name),
@@ -135,11 +214,7 @@ impl PackageAdapter for DnfAdapter {
             scope: InstallScope::System,
             tracked_files: files,
             declared_configs: configs,
-            size_bytes: SizeBreakdown {
-                package_size: size,
-                total_footprint: size,
-                ..Default::default()
-            },
+            size_bytes,
             summary,
             homepage,
             license,

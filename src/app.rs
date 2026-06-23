@@ -429,6 +429,22 @@ fn show_detail_page(app: AppFootprint, _state: &Arc<SharedState>) {
     add_row(&grid, r, "Package Size", &format_size(app.size_bytes.package_size));
     r += 1;
     add_row(&grid, r, "Total Footprint", &format_size(app.size_bytes.total_footprint));
+    r += 1;
+    if app.size_bytes.config_size > 0 {
+        add_row(&grid, r, "  Config", &format_size(app.size_bytes.config_size));
+        r += 1;
+    }
+    if app.size_bytes.data_size > 0 {
+        add_row(&grid, r, "  Data", &format_size(app.size_bytes.data_size));
+        r += 1;
+    }
+    if app.size_bytes.shared_size > 0 {
+        add_row(&grid, r, "  Shared Libs", &format_size(app.size_bytes.shared_size));
+        r += 1;
+    }
+    if app.size_bytes.cache_size > 0 {
+        add_row(&grid, r, "  Cache", &format_size(app.size_bytes.cache_size));
+    }
 
     content.append(&grid);
 
