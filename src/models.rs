@@ -204,6 +204,58 @@ pub struct HistoryEntry {
     pub error: Option<String>,
 }
 
+impl Default for AppFootprint {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            display_name: String::new(),
+            source: PackageSource::Unknown,
+            version: String::new(),
+            architecture: String::new(),
+            scope: InstallScope::System,
+            tracked_files: Vec::new(),
+            declared_configs: Vec::new(),
+            discovered_configs: Vec::new(),
+            discovered_cache: Vec::new(),
+            discovered_data: Vec::new(),
+            desktop_entries: Vec::new(),
+            systemd_services: Vec::new(),
+            running_processes: Vec::new(),
+            dependencies: Vec::new(),
+            reverse_dependencies: Vec::new(),
+            is_orphan_candidate: false,
+            size_bytes: SizeBreakdown::default(),
+            integrity_status: IntegrityStatus {
+                checked_at: Utc::now(),
+                modified_files: Vec::new(),
+                missing_files: Vec::new(),
+                checksum_algorithm: String::new(),
+            },
+            sandbox_permissions: Vec::new(),
+            last_accessed: None,
+            installed_at: None,
+            icon: None,
+            summary: String::new(),
+            description: String::new(),
+            homepage: None,
+            license: None,
+        }
+    }
+}
+
+impl Default for SizeBreakdown {
+    fn default() -> Self {
+        Self {
+            package_size: 0,
+            config_size: 0,
+            cache_size: 0,
+            data_size: 0,
+            shared_size: 0,
+            total_footprint: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppFootprint {
     pub id: String,
