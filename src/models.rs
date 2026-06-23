@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 
 pub type SystemPath = String;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PackageSource {
-    Apt,
     Rpm,
+    Apt,
     Flatpak,
     Snap,
     Loose,

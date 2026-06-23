@@ -14,6 +14,8 @@ thread_local! {
     static SCAN_SPINNER: RefCell<Option<gtk::Spinner>> = RefCell::new(None);
     static NAV_VIEW: RefCell<Option<adw::NavigationView>> = RefCell::new(None);
     static APP_STORE: RefCell<Option<gio::ListStore>> = RefCell::new(None);
+    static SORT_MODEL: RefCell<Option<gtk::SortListModel>> = RefCell::new(None);
+    static SORT_DROPDOWN: RefCell<Option<gtk::DropDown>> = RefCell::new(None);
 }
 
 struct SharedState {
@@ -85,6 +87,17 @@ fn build_list_page(state: Arc<SharedState>) -> adw::NavigationPage {
 
     SCAN_SPINNER.with(|s| *s.borrow_mut() = Some(spinner));
 
+    let sort_options = gtk::StringList::new(&[
+        "Name (A-Z)",
+        "Name (Z-A)",
+        "Size",
+        "Source",
+    ]);
+    let sort_dropdown = gtk::DropDown::new(Some(sort_options), None::<&gtk::PropertyExpression>);
+    sort_dropdown.set_selected(0);
+    SORT_DROPDOWN.with(|s| *s.borrow_mut() = Some(sort_dropdown.clone()));
+    header.pack_end(&sort_dropdown);
+
     let search_entry = gtk::SearchEntry::builder()
         .placeholder_text("Search apps…")
         .width_request(240)
@@ -95,7 +108,9 @@ fn build_list_page(state: Arc<SharedState>) -> adw::NavigationPage {
     APP_STORE.with(|s| *s.borrow_mut() = Some(store.clone()));
 
     let filter_model = gtk::FilterListModel::new(Some(store.clone()), None::<gtk::CustomFilter>);
-    let selection = gtk::SingleSelection::new(Some(filter_model.clone()));
+    let sort_model = gtk::SortListModel::new(Some(filter_model.clone()), None::<gtk::CustomSorter>);
+    SORT_MODEL.with(|s| *s.borrow_mut() = Some(sort_model.clone()));
+    let selection = gtk::SingleSelection::new(Some(sort_model.clone()));
     let factory = gtk::SignalListItemFactory::new();
 
     let sf = state.clone();
@@ -202,6 +217,15 @@ fn build_list_page(state: Arc<SharedState>) -> adw::NavigationPage {
         }
     });
 
+    {
+        let state = state.clone();
+        let sm = sort_model.clone();
+        sort_dropdown.connect_notify_local(Some("selected"), move |dd, _| {
+            let option = dd.selected();
+            let sorter = build_sorter(option, &state);
+            sm.set_sorter(Some(&sorter));
+        });
+    }
     let sel_state = state.clone();
     selection.connect_selection_changed(move |sel, _, _| {
         let selected = sel.selected_item();
@@ -252,6 +276,16 @@ fn build_list_page(state: Arc<SharedState>) -> adw::NavigationPage {
                     };
 
                     populate_store(&ids, total);
+                    SORT_DROPDOWN.with(|dd| {
+                        if let Some(ref dd) = *dd.borrow() {
+                            let option = dd.selected();
+                            SORT_MODEL.with(|sm| {
+                                if let Some(ref sm) = *sm.borrow() {
+                                    sm.set_sorter(Some(&build_sorter(option, &state_for_task)));
+                                }
+                            });
+                        }
+                    });
                     SCAN_SPINNER.with(|s| {
                         if let Some(ref sp) = *s.borrow() {
                             sp.stop();
@@ -267,6 +301,30 @@ fn build_list_page(state: Arc<SharedState>) -> adw::NavigationPage {
         .title("Orbit")
         .child(&toolbar)
         .build()
+}
+
+fn build_sorter(option: u32, state: &Arc<SharedState>) -> gtk::CustomSorter {
+    let state = state.clone();
+    gtk::CustomSorter::new(move |a, b| {
+        let aid = a
+            .downcast_ref::<gtk::StringObject>()
+            .map(|s| s.string());
+        let bid = b
+            .downcast_ref::<gtk::StringObject>()
+            .map(|s| s.string());
+        let apps = state.apps.lock().unwrap();
+        let aa = aid.as_ref().and_then(|id| apps.iter().find(|app| app.id == id.as_str()));
+        let bb = bid.as_ref().and_then(|id| apps.iter().find(|app| app.id == id.as_str()));
+        match (aa, bb) {
+        (Some(aa), Some(bb)) => match option {
+            0 => aa.display_name.cmp(&bb.display_name).into(),
+            1 => bb.display_name.cmp(&aa.display_name).into(),
+            2 => bb.size_bytes.total_footprint.cmp(&aa.size_bytes.total_footprint).into(),
+            _ => aa.source.cmp(&bb.source).into(),
+        },
+            _ => std::cmp::Ordering::Equal.into(),
+        }
+    })
 }
 
 fn populate_store(ids: &[String], total: usize) {
@@ -292,6 +350,17 @@ fn load_cached_apps(state: Arc<SharedState>) {
     let ids: Vec<String> = apps.iter().map(|a| a.id.clone()).collect();
     *state.apps.lock().unwrap() = apps;
     populate_store(&ids, total);
+
+    SORT_DROPDOWN.with(|dd| {
+        if let Some(ref dd) = *dd.borrow() {
+            let option = dd.selected();
+            SORT_MODEL.with(|sm| {
+                if let Some(ref sm) = *sm.borrow() {
+                    sm.set_sorter(Some(&build_sorter(option, &state)));
+                }
+            });
+        }
+    });
 }
 
 fn show_detail_page(app: AppFootprint, _state: &Arc<SharedState>) {
