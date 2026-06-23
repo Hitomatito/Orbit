@@ -1,20 +1,21 @@
 use adw::prelude::*;
 
+use crate::rt::AsyncRuntime;
+
 pub struct OrbitApp {
     app: adw::Application,
+    _rt: AsyncRuntime,
 }
 
 impl OrbitApp {
-    pub fn new() -> Self {
+    pub fn new(rt: AsyncRuntime) -> Self {
         let app = adw::Application::builder()
             .application_id("com.orbit.AppManager")
             .build();
 
-        app.connect_activate(move |app| {
-            Self::build_ui(app);
-        });
+        app.connect_activate(Self::build_ui);
 
-        Self { app }
+        Self { app, _rt: rt }
     }
 
     pub fn run(&self) {
