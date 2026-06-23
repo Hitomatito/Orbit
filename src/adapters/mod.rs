@@ -1,5 +1,6 @@
 pub mod appimage;
 pub mod dnf;
+pub mod dpkg;
 pub mod flatpak;
 pub mod snap;
 
