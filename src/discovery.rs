@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::adapters::{dnf::DnfAdapter, PackageAdapter};
+use crate::adapters::{
+    appimage::AppImageAdapter, dnf::DnfAdapter, flatpak::FlatpakAdapter, snap::SnapAdapter,
+    PackageAdapter,
+};
 use crate::db::Database;
 use crate::models::AppFootprint;
 
@@ -18,8 +21,12 @@ pub struct AppDiscoveryEngine {
 
 impl AppDiscoveryEngine {
     pub fn new(db: Arc<Database>) -> Self {
-        let adapters: Vec<Box<dyn PackageAdapter>> =
-            vec![Box::new(DnfAdapter::new())];
+        let adapters: Vec<Box<dyn PackageAdapter>> = vec![
+            Box::new(DnfAdapter::new()),
+            Box::new(FlatpakAdapter::new()),
+            Box::new(SnapAdapter::new()),
+            Box::new(AppImageAdapter::new()),
+        ];
 
         Self { adapters, db }
     }

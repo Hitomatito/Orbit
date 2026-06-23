@@ -1,4 +1,7 @@
+pub mod appimage;
 pub mod dnf;
+pub mod flatpak;
+pub mod snap;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
