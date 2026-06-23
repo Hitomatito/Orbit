@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
 mod adapters;
+mod app;
 mod models;
 
 fn main() {
-    println!("Orbit v{}", env!("CARGO_PKG_VERSION"));
+    let orbit = app::OrbitApp::new();
+    orbit.run();
 }
