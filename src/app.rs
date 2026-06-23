@@ -210,15 +210,33 @@ fn build_list_page(state: Arc<SharedState>) -> adw::NavigationPage {
 
     search_entry.connect_search_changed({
         let fm = filter_model.clone();
+        let sf = state.clone();
         move |entry| {
             let text = entry.text().to_lowercase();
+            let sf = sf.clone();
             let filter = gtk::CustomFilter::new(move |obj| {
                 if text.is_empty() {
                     return true;
                 }
-                obj.downcast_ref::<gtk::StringObject>()
-                    .map(|s| s.string().to_lowercase().contains(&text))
-                    .unwrap_or(true)
+                let so = match obj.downcast_ref::<gtk::StringObject>() {
+                    Some(s) => s,
+                    None => return true,
+                };
+                let id = so.string();
+                if id.to_lowercase().contains(&text) {
+                    return true;
+                }
+                if let Ok(apps) = sf.apps.lock() {
+                    if let Some(app) = apps.iter().find(|a| a.id == id.as_str()) {
+                        if app.display_name.to_lowercase().contains(&text) {
+                            return true;
+                        }
+                        if app.summary.to_lowercase().contains(&text) {
+                            return true;
+                        }
+                    }
+                }
+                false
             });
             fm.set_filter(Some(&filter));
         }
