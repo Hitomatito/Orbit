@@ -25,6 +25,7 @@ struct SharedState {
     rt: AsyncRuntime,
     discovery: AppDiscoveryEngine,
     apps: Mutex<Vec<AppFootprint>>,
+    db: Arc<Database>,
 }
 
 pub struct OrbitApp {
@@ -37,11 +38,12 @@ impl OrbitApp {
             .application_id("com.orbit.AppManager")
             .build();
 
-        let discovery = AppDiscoveryEngine::new(db);
+        let discovery = AppDiscoveryEngine::new(db.clone());
         let state = Arc::new(SharedState {
             rt,
             discovery,
             apps: Mutex::new(Vec::new()),
+            db,
         });
 
         app.connect_activate(move |app| {
@@ -677,6 +679,7 @@ fn show_uninstall_dialog(app: &AppFootprint, state: &Arc<SharedState>) {
     let state_clone = state.clone();
     let display_name = app.display_name.clone();
     let source = app.source.clone();
+    let app_id = app.id.clone();
 
     dialog.connect_response(None, move |d, response| {
         if response == "uninstall" {
@@ -691,25 +694,62 @@ fn show_uninstall_dialog(app: &AppFootprint, state: &Arc<SharedState>) {
                 }
             });
 
-            let body_text = match result {
+            let (body_text, _success) = match result {
                 Ok(r) if r.success => {
-                    format!(
-                        "Successfully uninstalled {}\nSpace freed: {}",
-                        display_name,
-                        format_size(r.space_freed)
+                    // Clean up database and UI
+                    let db = state_clone.db.clone();
+                    let _ = state_clone.rt.block_on(async {
+                        let _ = db.delete_app(&app_id);
+                    });
+                    
+                    // Remove from in-memory list
+                    if let Ok(mut apps) = state_clone.apps.lock() {
+                        apps.retain(|a| a.id != app_id);
+                    }
+                    
+                    // Remove from UI list store
+                    APP_STORE.with(|store| {
+                        if let Some(ref s) = *store.borrow() {
+                            let mut i = 0;
+                            while i < s.n_items() {
+                                if let Some(obj) = s.item(i).and_downcast::<gtk::StringObject>() {
+                                    if obj.string().starts_with(&app_id) {
+                                        s.remove(i);
+                                        break;
+                                    }
+                                }
+                                i += 1;
+                            }
+                        }
+                    });
+                    
+                    // Pop detail view
+                    NAV_VIEW.with(|n| {
+                        if let Some(ref nav) = *n.borrow() {
+                            nav.pop();
+                        }
+                    });
+                    
+                    (
+                        format!(
+                            "Successfully uninstalled {}\nSpace freed: {}",
+                            display_name,
+                            format_size(r.space_freed)
+                        ),
+                        true
                     )
                 }
-                Ok(r) => {
+                Ok(r) => (
                     format!(
                         "Uninstall failed: {}\nSpace freed: {}",
                         r.error_message.unwrap_or_else(|| "Unknown error".into()),
                         format_size(r.space_freed)
-                    )
-                }
-                Err(e) => {
-                    format!("Error: {}", e)
-                }
+                    ),
+                    false
+                ),
+                Err(e) => (format!("Error: {}", e), false),
             };
+            
             let result_dialog = adw::MessageDialog::new(
                 parent.as_ref(),
                 Some("Uninstall Result"),

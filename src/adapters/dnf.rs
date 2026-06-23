@@ -412,9 +412,12 @@ impl PackageAdapter for DnfAdapter {
                 })
             }
             Ok(output) => {
+                // Check if pkexec itself failed (exit code 127 = command not found)
+                let pkexec_not_found = output.status.code() == Some(127);
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                // pkexec might not be available; try plain rpm
-                if stderr.contains("pkexec") || stderr.contains("not found") {
+                
+                // Only fall back to bare rpm if pkexec is not installed
+                if pkexec_not_found {
                     let fallback = tokio::process::Command::new("rpm")
                         .args(["-e", pkg])
                         .output()

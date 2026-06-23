@@ -431,7 +431,9 @@ impl PackageAdapter for FlatpakAdapter {
 
         // Verify app exists
         let info = Self::flatpak_output(&["info", fp_id]).await?;
-        let info_line = info.first().ok_or_else(|| AdapterError::AppNotFound(fp_id.to_string()))?;
+        let info_line = info.iter()
+            .find(|l| !l.trim().is_empty())
+            .ok_or_else(|| AdapterError::AppNotFound(fp_id.to_string()))?;
 
         let display_name = info_line.trim().split(" - ").next().unwrap_or(fp_id).to_string();
 

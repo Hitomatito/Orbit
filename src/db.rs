@@ -170,6 +170,12 @@ impl Database {
         Ok(())
     }
 
+    pub fn delete_app(&self, app_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM apps WHERE id = ?1", [app_id])?;
+        Ok(())
+    }
+
     pub fn get_all_apps(&self) -> anyhow::Result<Vec<AppFootprint>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
