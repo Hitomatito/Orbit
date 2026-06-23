@@ -1,3 +1,5 @@
+pub mod dnf;
+
 use tokio_util::sync::CancellationToken;
 
 use crate::models::{
