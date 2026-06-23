@@ -7,7 +7,7 @@ use crate::adapters::{
     PackageAdapter,
 };
 use crate::db::Database;
-use crate::models::AppFootprint;
+use crate::models::{AppFootprint, PackageSource};
 
 pub struct ScanResult {
     pub total: usize,
@@ -62,6 +62,18 @@ impl AppDiscoveryEngine {
 
         let total = all_apps.len();
         ScanResult { total, errors }
+    }
+
+    pub fn get_adapter(&self, source: PackageSource) -> Option<&Box<dyn PackageAdapter>> {
+        let backend = match source {
+            PackageSource::Rpm => "rpm",
+            PackageSource::Apt => "dpkg",
+            PackageSource::Flatpak => "flatpak",
+            PackageSource::Snap => "snap",
+            PackageSource::Loose => "appimage",
+            PackageSource::Unknown => return None,
+        };
+        self.adapters.iter().find(|a| a.backend_id() == backend)
     }
 
     pub fn get_cached_apps(&self) -> Vec<AppFootprint> {

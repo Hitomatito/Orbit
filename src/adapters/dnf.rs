@@ -9,10 +9,26 @@ use async_trait::async_trait;
 use crate::adapters::{AdapterError, PackageAdapter};
 use crate::models::{
     AppFootprint, DependencyInfo, DependencyType, InstallScope, IntegrityStatus, PackageSource,
-    SizeBreakdown, SystemPath, UninstallOptions, UninstallPlan, UninstallResult,
+    SizeBreakdown, StageType, SystemPath, UninstallOptions, UninstallPlan, UninstallResult,
+    UninstallStage, UninstallWarning,
 };
 
 pub struct DnfAdapter;
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut s = bytes as f64;
+    let mut i = 0;
+    while s >= 1024.0 && i < UNITS.len() - 1 {
+        s /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{} {}", bytes, UNITS[i])
+    } else {
+        format!("{:.1} {}", s, UNITS[i])
+    }
+}
 
 impl DnfAdapter {
     pub fn new() -> Self {
@@ -277,21 +293,204 @@ impl PackageAdapter for DnfAdapter {
 
     async fn plan_uninstall(
         &self,
-        _app_id: &str,
-        _options: UninstallOptions,
+        app_id: &str,
+        options: UninstallOptions,
     ) -> Result<UninstallPlan, AdapterError> {
-        Err(AdapterError::NotAvailable(
-            "uninstall planning not implemented yet".into(),
-        ))
+        let pkg = app_id.strip_prefix("rpm:").unwrap_or(app_id);
+
+        // Verify the package exists and get its info
+        let info = Self::rpm_output(&[
+            "-q",
+            "--queryformat",
+            "%{NAME}\t%{VERSION}-%{RELEASE}\t%{SIZE}\t%{ARCHIVESIZE}\t%{SUMMARY}\n",
+            pkg,
+        ])
+        .await?;
+        let info_line = info
+            .first()
+            .ok_or_else(|| AdapterError::AppNotFound(pkg.to_string()))?;
+        let info_parts: Vec<&str> = info_line.splitn(5, '\t').collect();
+        if info_parts.len() < 2 {
+            return Err(AdapterError::Parse("unexpected rpm format".into()));
+        }
+
+        let name = info_parts[0].to_string();
+        let _version = info_parts[1].to_string();
+        let installed_size: u64 = info_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let archive_size: u64 = info_parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+        // Get all files for the package
+        let all_files = self.list_files(app_id).await.unwrap_or_default();
+
+        // Get config files
+        let config_files = self.list_declared_configs(app_id).await.unwrap_or_default();
+
+        // Get reverse dependencies (packages that would break)
+        let rev_deps = self.list_reverse_dependencies(app_id).await.unwrap_or_default();
+
+        // Separate desktop entries
+        let desktop_entries: Vec<_> = all_files
+            .iter()
+            .filter(|f| f.ends_with(".desktop"))
+            .cloned()
+            .collect();
+
+        let mut stages = Vec::new();
+
+        // Stage: Remove package
+        stages.push(UninstallStage {
+            stage_type: StageType::RemovePackage,
+            description: format!("Remove RPM package '{}' (archive size: {})", name, format_size(archive_size)),
+            items: all_files.clone(),
+            requires_root: true,
+            reversible: false,
+        });
+
+        // Stage: Remove config files
+        if options.remove_configs && !config_files.is_empty() {
+            stages.push(UninstallStage {
+                stage_type: StageType::RemoveConfigs,
+                description: format!("Remove {} config files", config_files.len()),
+                items: config_files.clone(),
+                requires_root: true,
+                reversible: true,
+            });
+        }
+
+        // Stage: Remove desktop entries
+        if !desktop_entries.is_empty() {
+            stages.push(UninstallStage {
+                stage_type: StageType::RemoveDesktopEntries,
+                description: format!("Remove {} desktop entries", desktop_entries.len()),
+                items: desktop_entries,
+                requires_root: false,
+                reversible: true,
+            });
+        }
+
+        // Warnings for reverse dependencies
+        let mut warnings = Vec::new();
+        if !rev_deps.is_empty() {
+            warnings.push(UninstallWarning::RequiredBySystem(rev_deps));
+        }
+
+        let total_space = installed_size;
+
+        Ok(UninstallPlan {
+            app_id: app_id.to_string(),
+            app_name: name,
+            stages,
+            total_space_to_free: total_space,
+            warnings,
+            backup_recommendation: None,
+        })
     }
 
     async fn execute_uninstall(
         &self,
-        _plan: &UninstallPlan,
+        plan: &UninstallPlan,
         _cancel: CancellationToken,
     ) -> Result<UninstallResult, AdapterError> {
-        Err(AdapterError::NotAvailable(
-            "uninstall execution not implemented yet".into(),
-        ))
+        let pkg = plan.app_id.strip_prefix("rpm:").unwrap_or(&plan.app_id);
+
+        // Try pkexec rpm -e first, fall back to plain rpm (may fail without root)
+        let result = tokio::process::Command::new("pkexec")
+            .args(["rpm", "-e", pkg])
+            .output()
+            .await;
+
+        match result {
+            Ok(output) if output.status.success() => {
+                Ok(UninstallResult {
+                    app_id: plan.app_id.clone(),
+                    success: true,
+                    stages_completed: vec![StageType::RemovePackage],
+                    stages_failed: Vec::new(),
+                    space_freed: plan.total_space_to_free,
+                    backup_path: None,
+                    error_message: None,
+                })
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // pkexec might not be available; try plain rpm
+                if stderr.contains("pkexec") || stderr.contains("not found") {
+                    let fallback = tokio::process::Command::new("rpm")
+                        .args(["-e", pkg])
+                        .output()
+                        .await?;
+                    if fallback.status.success() {
+                        Ok(UninstallResult {
+                            app_id: plan.app_id.clone(),
+                            success: true,
+                            stages_completed: vec![StageType::RemovePackage],
+                            stages_failed: Vec::new(),
+                            space_freed: plan.total_space_to_free,
+                            backup_path: None,
+                            error_message: None,
+                        })
+                    } else {
+                        let err = String::from_utf8_lossy(&fallback.stderr);
+                        Ok(UninstallResult {
+                            app_id: plan.app_id.clone(),
+                            success: false,
+                            stages_completed: Vec::new(),
+                            stages_failed: vec![StageType::RemovePackage],
+                            space_freed: 0,
+                            backup_path: None,
+                            error_message: Some(format!(
+                                "rpm -e failed: {}",
+                                err.trim()
+                            )),
+                        })
+                    }
+                } else {
+                    Ok(UninstallResult {
+                        app_id: plan.app_id.clone(),
+                        success: false,
+                        stages_completed: Vec::new(),
+                        stages_failed: vec![StageType::RemovePackage],
+                        space_freed: 0,
+                        backup_path: None,
+                        error_message: Some(format!(
+                            "pkexec rpm -e failed: {}",
+                            stderr.trim()
+                        )),
+                    })
+                }
+            }
+            Err(_e) => {
+                // pkexec not installed; try bare rpm
+                let fallback = tokio::process::Command::new("rpm")
+                    .args(["-e", pkg])
+                    .output()
+                    .await?;
+                if fallback.status.success() {
+                    Ok(UninstallResult {
+                        app_id: plan.app_id.clone(),
+                        success: true,
+                        stages_completed: vec![StageType::RemovePackage],
+                        stages_failed: Vec::new(),
+                        space_freed: plan.total_space_to_free,
+                        backup_path: None,
+                        error_message: None,
+                    })
+                } else {
+                    let err = String::from_utf8_lossy(&fallback.stderr);
+                    Ok(UninstallResult {
+                        app_id: plan.app_id.clone(),
+                        success: false,
+                        stages_completed: Vec::new(),
+                        stages_failed: vec![StageType::RemovePackage],
+                        space_freed: 0,
+                        backup_path: None,
+                        error_message: Some(format!(
+                            "rpm -e failed: {}. Try with sudo.",
+                            err.trim()
+                        )),
+                    })
+                }
+            }
+        }
     }
 }

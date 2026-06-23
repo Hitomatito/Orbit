@@ -5,8 +5,9 @@ use async_trait::async_trait;
 
 use crate::adapters::{AdapterError, PackageAdapter};
 use crate::models::{
-    AppFootprint, DependencyInfo, InstallScope, IntegrityStatus, PackageSource,
-    SizeBreakdown, SystemPath, UninstallOptions, UninstallPlan, UninstallResult,
+    AppFootprint, DependencyInfo, InstallScope, IntegrityStatus, PackageSource, ProcessInfo,
+    SizeBreakdown, StageType, SystemPath, UninstallOptions, UninstallPlan, UninstallResult,
+    UninstallStage, UninstallWarning,
 };
 
 pub struct SnapAdapter;
@@ -69,6 +70,55 @@ impl SnapAdapter {
         }
 
         total
+    }
+
+    async fn snap_data_dirs(snap_name: &str) -> Vec<String> {
+        let mut dirs = Vec::new();
+        let var_snap = format!("/var/snap/{}", snap_name);
+        if std::path::Path::new(&var_snap).exists() {
+            dirs.push(var_snap);
+        }
+        let home_snap = format!(
+            "{}/snap/{}",
+            std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
+            snap_name
+        );
+        if std::path::Path::new(&home_snap).exists() {
+            dirs.push(home_snap);
+        }
+        dirs
+    }
+
+    async fn is_snap_running(snap_name: &str) -> Vec<ProcessInfo> {
+        let Ok(mut entries) = tokio::fs::read_dir("/proc").await else {
+            return Vec::new();
+        };
+        let name_lower = snap_name.to_lowercase();
+        let mut processes = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let pid_str = entry.file_name().to_string_lossy().to_string();
+            let pid: u32 = match pid_str.parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let cmdline_path = format!("/proc/{}/cmdline", pid_str);
+            if let Ok(cmd) = tokio::fs::read_to_string(&cmdline_path).await {
+                if cmd.to_lowercase().contains(&name_lower) {
+                    let name = std::path::Path::new(&cmd.split('\0').next().unwrap_or(""))
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    processes.push(ProcessInfo {
+                        pid,
+                        name,
+                        cmdline: cmd.replace('\0', " "),
+                        memory_bytes: 0,
+                    });
+                }
+            }
+        }
+        processes
     }
 }
 
@@ -252,21 +302,102 @@ impl PackageAdapter for SnapAdapter {
 
     async fn plan_uninstall(
         &self,
-        _app_id: &str,
+        app_id: &str,
         _options: UninstallOptions,
     ) -> Result<UninstallPlan, AdapterError> {
-        Err(AdapterError::NotAvailable(
-            "uninstall planning not implemented yet".into(),
-        ))
+        let snap_name = app_id.strip_prefix("snap:").unwrap_or(app_id);
+
+        // Verify snap exists
+        Self::snap_output(&["list", snap_name]).await?;
+
+        let size = Self::measure_snap_size(snap_name).await;
+        let data_dirs = Self::snap_data_dirs(snap_name).await;
+
+        let mut stages = Vec::new();
+
+        stages.push(UninstallStage {
+            stage_type: StageType::RemovePackage,
+            description: format!("Remove snap '{}' (size: {} bytes)", snap_name, size),
+            items: vec![snap_name.to_string()],
+            requires_root: true,
+            reversible: false,
+        });
+
+        if !data_dirs.is_empty() {
+            stages.push(UninstallStage {
+                stage_type: StageType::RemoveData,
+                description: format!("Remove snap data directories ({} items)", data_dirs.len()),
+                items: data_dirs.clone(),
+                requires_root: true,
+                reversible: true,
+            });
+        }
+
+        let mut warnings = Vec::new();
+        let procs = Self::is_snap_running(snap_name).await;
+        if !procs.is_empty() {
+            warnings.push(UninstallWarning::RunningProcesses(procs));
+        }
+
+        Ok(UninstallPlan {
+            app_id: app_id.to_string(),
+            app_name: snap_name.to_string(),
+            stages,
+            total_space_to_free: size,
+            warnings,
+            backup_recommendation: None,
+        })
     }
 
     async fn execute_uninstall(
         &self,
-        _plan: &UninstallPlan,
+        plan: &UninstallPlan,
         _cancel: CancellationToken,
     ) -> Result<UninstallResult, AdapterError> {
-        Err(AdapterError::NotAvailable(
-            "uninstall execution not implemented yet".into(),
-        ))
+        let snap_name = plan.app_id.strip_prefix("snap:").unwrap_or(&plan.app_id);
+
+        // Try without root first, then use pkexec
+        let output = Command::new("snap")
+            .args(["remove", snap_name])
+            .output()
+            .await?;
+
+        let success = if output.status.success() {
+            true
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("permission") || stderr.contains("denied") || stderr.contains("root")
+            {
+                let pkexec_output = Command::new("pkexec")
+                    .args(["snap", "remove", snap_name])
+                    .output()
+                    .await?;
+                pkexec_output.status.success()
+            } else {
+                false
+            }
+        };
+
+        Ok(UninstallResult {
+            app_id: plan.app_id.clone(),
+            success,
+            stages_completed: if success {
+                vec![StageType::RemovePackage]
+            } else {
+                Vec::new()
+            },
+            stages_failed: if success {
+                Vec::new()
+            } else {
+                vec![StageType::RemovePackage]
+            },
+            space_freed: if success { plan.total_space_to_free } else { 0 },
+            backup_path: None,
+            error_message: if success {
+                None
+            } else {
+                Some("Failed to remove snap package".to_string())
+            },
+        })
     }
 }

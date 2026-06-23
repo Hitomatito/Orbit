@@ -8,8 +8,9 @@ use async_trait::async_trait;
 
 use crate::adapters::{AdapterError, PackageAdapter};
 use crate::models::{
-    AppFootprint, DependencyInfo, InstallScope, IntegrityStatus, PackageSource, SizeBreakdown,
-    SystemPath, UninstallOptions, UninstallPlan, UninstallResult,
+    AppFootprint, DependencyInfo, InstallScope, IntegrityStatus, PackageSource, ProcessInfo,
+    SizeBreakdown, StageType, SystemPath, UninstallOptions, UninstallPlan, UninstallResult,
+    UninstallStage, UninstallWarning,
 };
 
 pub struct AppImageAdapter;
@@ -132,6 +133,55 @@ impl AppImageAdapter {
         } else {
             name
         }
+    }
+
+    async fn find_appimage(filename: &str) -> Result<Option<String>, AdapterError> {
+        for dir in Self::scan_dirs() {
+            let path = std::path::PathBuf::from(&dir).join(filename);
+            let exists = tokio::fs::try_exists(&path)
+                .await
+                .unwrap_or(false);
+            if exists {
+                return Ok(Some(path.to_string_lossy().to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn is_appimage_running(filename: &str) -> Vec<ProcessInfo> {
+        let Ok(mut entries) = tokio::fs::read_dir("/proc").await else {
+            return Vec::new();
+        };
+        let name_lower = filename
+            .trim_end_matches(".AppImage")
+            .trim_end_matches(".appimage")
+            .to_lowercase();
+        let mut processes = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let pid_str = entry.file_name().to_string_lossy().to_string();
+            let pid: u32 = match pid_str.parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let cmdline_path = format!("/proc/{}/cmdline", pid_str);
+            if let Ok(cmd) = tokio::fs::read_to_string(&cmdline_path).await {
+                let cmd_lower = cmd.to_lowercase();
+                if cmd_lower.contains(&name_lower) {
+                    let name = std::path::Path::new(&cmd.split('\0').next().unwrap_or(""))
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    processes.push(ProcessInfo {
+                        pid,
+                        name,
+                        cmdline: cmd.replace('\0', " "),
+                        memory_bytes: 0,
+                    });
+                }
+            }
+        }
+        processes
     }
 }
 
@@ -293,21 +343,111 @@ impl PackageAdapter for AppImageAdapter {
 
     async fn plan_uninstall(
         &self,
-        _app_id: &str,
+        app_id: &str,
         _options: UninstallOptions,
     ) -> Result<UninstallPlan, AdapterError> {
-        Err(AdapterError::NotAvailable(
-            "uninstall planning not implemented yet".into(),
-        ))
+        let appimage_name = app_id.strip_prefix("appimage:").unwrap_or(app_id);
+
+        // Find the actual file path
+        let file_path = Self::find_appimage(appimage_name)
+            .await?
+            .ok_or_else(|| AdapterError::AppNotFound(appimage_name.to_string()))?;
+
+        let meta = fs::metadata(&file_path).await.map_err(AdapterError::Io)?;
+        let size = meta.len();
+        let display_name = Self::parse_name(appimage_name);
+
+        let mut stages = Vec::new();
+
+        stages.push(UninstallStage {
+            stage_type: StageType::RemovePackage,
+            description: format!("Delete AppImage '{}' ({})", display_name, file_path),
+            items: vec![file_path.clone()],
+            requires_root: false,
+            reversible: true,
+        });
+
+        // Check for common data directories
+        let name_lower = display_name.to_lowercase().replace(' ', "-");
+        let data_candidates = vec![
+            format!("{}/.config/{}", std::env::var("HOME").unwrap_or_default(), name_lower),
+            format!("{}/.local/share/{}", std::env::var("HOME").unwrap_or_default(), name_lower),
+            format!("{}/.cache/{}", std::env::var("HOME").unwrap_or_default(), name_lower),
+        ];
+
+        let mut existing_data = Vec::new();
+        for d in &data_candidates {
+            if std::path::Path::new(d).exists() {
+                existing_data.push(d.clone());
+            }
+        }
+
+        if !existing_data.is_empty() {
+            stages.push(UninstallStage {
+                stage_type: StageType::RemoveData,
+                description: format!("Remove application data directories ({} items)", existing_data.len()),
+                items: existing_data,
+                requires_root: false,
+                reversible: true,
+            });
+        }
+
+        let mut warnings = Vec::new();
+        let procs = Self::is_appimage_running(appimage_name).await;
+        if !procs.is_empty() {
+            warnings.push(UninstallWarning::RunningProcesses(procs));
+        }
+
+        Ok(UninstallPlan {
+            app_id: app_id.to_string(),
+            app_name: display_name,
+            stages,
+            total_space_to_free: size,
+            warnings,
+            backup_recommendation: None,
+        })
     }
 
     async fn execute_uninstall(
         &self,
-        _plan: &UninstallPlan,
+        plan: &UninstallPlan,
         _cancel: CancellationToken,
     ) -> Result<UninstallResult, AdapterError> {
-        Err(AdapterError::NotAvailable(
-            "uninstall execution not implemented yet".into(),
-        ))
+        let mut stages_completed = Vec::new();
+        let mut stages_failed = Vec::new();
+        let mut space_freed = 0;
+        let mut error_message = None;
+
+        for stage in &plan.stages {
+            match stage.stage_type {
+                StageType::RemovePackage => {
+                    for item in &stage.items {
+                        if let Err(e) = fs::remove_file(item).await {
+                            stages_failed.push(stage.stage_type.clone());
+                            error_message = Some(format!("Failed to delete {}: {}", item, e));
+                        } else {
+                            stages_completed.push(stage.stage_type.clone());
+                            space_freed += plan.total_space_to_free;
+                        }
+                    }
+                }
+                StageType::RemoveData => {
+                    for item in &stage.items {
+                        let _ = fs::remove_dir_all(item).await;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(UninstallResult {
+            app_id: plan.app_id.clone(),
+            success: stages_failed.is_empty(),
+            stages_completed,
+            stages_failed,
+            space_freed,
+            backup_path: None,
+            error_message,
+        })
     }
 }

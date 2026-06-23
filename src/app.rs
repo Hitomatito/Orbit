@@ -4,10 +4,12 @@ use std::sync::{Arc, Mutex};
 use adw::prelude::*;
 use gio::ListStore;
 
+use crate::adapters::AdapterError;
 use crate::db::Database;
 use crate::discovery::AppDiscoveryEngine;
 use crate::models::{AppFootprint, PackageSource};
 use crate::rt::AsyncRuntime;
+use tokio_util::sync::CancellationToken;
 
 thread_local! {
     static SCAN_BTN: RefCell<Option<gtk::Button>> = RefCell::new(None);
@@ -16,6 +18,7 @@ thread_local! {
     static APP_STORE: RefCell<Option<gio::ListStore>> = RefCell::new(None);
     static SORT_MODEL: RefCell<Option<gtk::SortListModel>> = RefCell::new(None);
     static SORT_DROPDOWN: RefCell<Option<gtk::DropDown>> = RefCell::new(None);
+    static APP_WINDOW: RefCell<Option<adw::ApplicationWindow>> = RefCell::new(None);
 }
 
 struct SharedState {
@@ -59,6 +62,8 @@ impl OrbitApp {
             .default_width(960)
             .default_height(720)
             .build();
+
+        APP_WINDOW.with(|w| *w.borrow_mut() = Some(window.clone()));
 
         let nav = adw::NavigationView::new();
         let list_page = build_list_page(state.clone());
@@ -363,19 +368,29 @@ fn load_cached_apps(state: Arc<SharedState>) {
     });
 }
 
-fn show_detail_page(app: AppFootprint, _state: &Arc<SharedState>) {
+fn show_detail_page(app: AppFootprint, state: &Arc<SharedState>) {
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
 
     let back_btn = gtk::Button::with_label("Back");
     header.pack_start(&back_btn);
 
-    let scroll = gtk::ScrolledWindow::new();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.set_margin_start(24);
-    content.set_margin_end(24);
-    content.set_margin_top(24);
-    content.set_margin_bottom(24);
+    let stack = adw::ViewStack::new();
+    let switcher = adw::ViewSwitcher::new();
+    switcher.set_stack(Some(&stack));
+    switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
+    header.set_title_widget(Some(&switcher));
+
+    let uninstall_btn = gtk::Button::with_label("Uninstall");
+    uninstall_btn.add_css_class("destructive-action");
+    header.pack_end(&uninstall_btn);
+
+    // ---- Info page ----
+    let info_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    info_box.set_margin_start(24);
+    info_box.set_margin_end(24);
+    info_box.set_margin_top(24);
+    info_box.set_margin_bottom(24);
 
     let name_lbl = gtk::Label::builder()
         .label(&app.display_name)
@@ -383,7 +398,7 @@ fn show_detail_page(app: AppFootprint, _state: &Arc<SharedState>) {
         .xalign(0.0)
         .wrap(true)
         .build();
-    content.append(&name_lbl);
+    info_box.append(&name_lbl);
 
     let (st, sc) = source_badge(&app.source);
     let src_badge = gtk::Label::builder()
@@ -391,7 +406,7 @@ fn show_detail_page(app: AppFootprint, _state: &Arc<SharedState>) {
         .css_classes([sc])
         .xalign(0.0)
         .build();
-    content.append(&src_badge);
+    info_box.append(&src_badge);
 
     if !app.summary.is_empty() {
         let sum_lbl = gtk::Label::builder()
@@ -400,7 +415,7 @@ fn show_detail_page(app: AppFootprint, _state: &Arc<SharedState>) {
             .xalign(0.0)
             .wrap(true)
             .build();
-        content.append(&sum_lbl);
+        info_box.append(&sum_lbl);
     }
 
     if !app.description.is_empty() {
@@ -411,7 +426,7 @@ fn show_detail_page(app: AppFootprint, _state: &Arc<SharedState>) {
             .wrap(true)
             .selectable(true)
             .build();
-        content.append(&desc_lbl);
+        info_box.append(&desc_lbl);
     }
 
     let grid = gtk::Grid::new();
@@ -446,11 +461,105 @@ fn show_detail_page(app: AppFootprint, _state: &Arc<SharedState>) {
         add_row(&grid, r, "  Cache", &format_size(app.size_bytes.cache_size));
     }
 
-    content.append(&grid);
+    info_box.append(&grid);
 
-    scroll.set_child(Some(&content));
+    let info_scroll = gtk::ScrolledWindow::builder()
+        .child(&info_box)
+        .vexpand(true)
+        .build();
+    stack.add_titled(&info_scroll, Some("info"), "Info");
+
+    // ---- Dependencies page ----
+    let deps_scroll = gtk::ScrolledWindow::new();
+    let deps_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    deps_box.set_margin_start(12);
+    deps_box.set_margin_end(12);
+    deps_box.set_margin_top(12);
+    deps_box.set_margin_bottom(12);
+
+    let deps_spinner = gtk::Spinner::new();
+    deps_spinner.start();
+    deps_box.append(&deps_spinner);
+
+    let deps_list_store = gio::ListStore::new::<gtk::StringObject>();
+    let deps_factory = gtk::SignalListItemFactory::new();
+    deps_factory.connect_setup(|_, item| {
+        let lbl = gtk::Label::new(None);
+        lbl.set_xalign(0.0);
+        lbl.set_margin_start(8);
+        lbl.set_margin_end(8);
+        lbl.set_margin_top(4);
+        lbl.set_margin_bottom(4);
+        item.downcast_ref::<gtk::ListItem>()
+            .expect("ListItem")
+            .set_child(Some(&lbl));
+    });
+    deps_factory.connect_bind(|_, item| {
+        let li = item.downcast_ref::<gtk::ListItem>().expect("ListItem");
+        if let Some(obj) = li.item().and_downcast::<gtk::StringObject>() {
+            if let Some(lbl) = li.child().and_downcast::<gtk::Label>() {
+                lbl.set_label(&obj.string());
+            }
+        }
+    });
+    let deps_list_view = gtk::ListView::new(
+        Some(gtk::SingleSelection::new(Some(deps_list_store.clone()))),
+        Some(deps_factory),
+    );
+    deps_list_view.add_css_class("boxed-list");
+    deps_box.append(&deps_list_view);
+
+    deps_scroll.set_child(Some(&deps_box));
+    stack.add_titled(&deps_scroll, Some("deps"), "Dependencies");
+
+    // ---- Files page ----
+    let files_scroll = gtk::ScrolledWindow::new();
+    let files_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    files_box.set_margin_start(12);
+    files_box.set_margin_end(12);
+    files_box.set_margin_top(12);
+    files_box.set_margin_bottom(12);
+
+    let files_spinner = gtk::Spinner::new();
+    files_spinner.start();
+    files_box.append(&files_spinner);
+
+    let files_list_store = gio::ListStore::new::<gtk::StringObject>();
+    let files_factory = gtk::SignalListItemFactory::new();
+    files_factory.connect_setup(|_, item| {
+        let lbl = gtk::Label::new(None);
+        lbl.set_xalign(0.0);
+        lbl.set_margin_start(8);
+        lbl.set_margin_end(8);
+        lbl.set_margin_top(4);
+        lbl.set_margin_bottom(4);
+        lbl.add_css_class("mono");
+        lbl.set_wrap(true);
+        lbl.set_selectable(true);
+        item.downcast_ref::<gtk::ListItem>()
+            .expect("ListItem")
+            .set_child(Some(&lbl));
+    });
+    files_factory.connect_bind(|_, item| {
+        let li = item.downcast_ref::<gtk::ListItem>().expect("ListItem");
+        if let Some(obj) = li.item().and_downcast::<gtk::StringObject>() {
+            if let Some(lbl) = li.child().and_downcast::<gtk::Label>() {
+                lbl.set_label(&obj.string());
+            }
+        }
+    });
+    let files_list_view = gtk::ListView::new(
+        Some(gtk::SingleSelection::new(Some(files_list_store.clone()))),
+        Some(files_factory),
+    );
+    files_list_view.add_css_class("boxed-list");
+    files_box.append(&files_list_view);
+
+    files_scroll.set_child(Some(&files_box));
+    stack.add_titled(&files_scroll, Some("files"), "Files");
+
     toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&scroll));
+    toolbar.set_content(Some(&stack));
 
     let page = adw::NavigationPage::builder()
         .title(&app.display_name)
@@ -466,6 +575,156 @@ fn show_detail_page(app: AppFootprint, _state: &Arc<SharedState>) {
             nav.push(&page);
         }
     });
+
+    // ---- Load dependencies and files ----
+    // Use block_on on the main thread — these queries are fast (<50ms each)
+    let app_id_clone = app.id.clone();
+    if let Some(adapter) = state.discovery.get_adapter(app.source) {
+        match state.rt.block_on(adapter.list_dependencies(&app_id_clone)) {
+            Ok(deps) => {
+                deps_spinner.stop();
+                deps_spinner.set_visible(false);
+                for dep in &deps {
+                    let label = if dep.version.is_empty() {
+                        dep.name.clone()
+                    } else {
+                        format!("{} ({})", dep.name, dep.version)
+                    };
+                    deps_list_store.append(&gtk::StringObject::new(&label));
+                }
+            }
+            Err(e) => {
+                deps_spinner.stop();
+                deps_spinner.set_visible(false);
+                deps_list_store.append(&gtk::StringObject::new(&format!("(error: {})", e)));
+            }
+        }
+
+        match state.rt.block_on(adapter.list_files(&app_id_clone)) {
+            Ok(files) => {
+                files_spinner.stop();
+                files_spinner.set_visible(false);
+                for f in &files {
+                    files_list_store.append(&gtk::StringObject::new(f));
+                }
+            }
+            Err(e) => {
+                files_spinner.stop();
+                files_spinner.set_visible(false);
+                files_list_store.append(&gtk::StringObject::new(&format!("(error: {})", e)));
+            }
+        }
+    }
+
+    // ---- Uninstall dialog ----
+    let state_for_dialog = state.clone();
+    let app_clone = app.clone();
+    uninstall_btn.connect_clicked(move |_| {
+        show_uninstall_dialog(&app_clone, &state_for_dialog);
+    });
+}
+
+fn show_uninstall_dialog(app: &AppFootprint, state: &Arc<SharedState>) {
+    let parent = APP_WINDOW.with(|w| w.borrow().clone());
+    let dialog = adw::MessageDialog::new(
+        parent.as_ref(),
+        Some(&format!("Uninstall {}", app.display_name)),
+        Some("Loading uninstall plan…"),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("uninstall", "Uninstall");
+    dialog.set_response_appearance("uninstall", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    // Load uninstall plan synchronously (brief block_on)
+    let plan = state.rt.block_on(async {
+        match state.discovery.get_adapter(app.source) {
+            Some(a) => a.plan_uninstall(
+                &app.id,
+                crate::models::UninstallOptions::default(),
+            ).await,
+            None => Err(AdapterError::NotAvailable("no adapter".into())),
+        }
+    });
+
+    let plan = match plan {
+        Ok(p) => {
+            let stages: Vec<_> = p
+                .stages
+                .iter()
+                .map(|s| format!("• {}", s.description))
+                .collect();
+            dialog.set_body(&format!(
+                "Uninstall plan ({} steps):\n{}\n\nTotal space to free: {}",
+                p.stages.len(),
+                stages.join("\n"),
+                format_size(p.total_space_to_free),
+            ));
+            p
+        }
+        Err(e) => {
+            dialog.set_body(&format!(
+                "Could not generate uninstall plan:\n{}",
+                e
+            ));
+            dialog.present();
+            return;
+        }
+    };
+
+    let plan_clone = plan.clone();
+    let state_clone = state.clone();
+    let display_name = app.display_name.clone();
+    let source = app.source.clone();
+
+    dialog.connect_response(None, move |d, response| {
+        if response == "uninstall" {
+            d.close();
+
+            // Execute uninstall
+            let result = state_clone.rt.block_on(async {
+                if let Some(a) = state_clone.discovery.get_adapter(source) {
+                    a.execute_uninstall(&plan_clone, CancellationToken::new()).await
+                } else {
+                    Err(AdapterError::NotAvailable("no adapter".into()))
+                }
+            });
+
+            let body_text = match result {
+                Ok(r) if r.success => {
+                    format!(
+                        "Successfully uninstalled {}\nSpace freed: {}",
+                        display_name,
+                        format_size(r.space_freed)
+                    )
+                }
+                Ok(r) => {
+                    format!(
+                        "Uninstall failed: {}\nSpace freed: {}",
+                        r.error_message.unwrap_or_else(|| "Unknown error".into()),
+                        format_size(r.space_freed)
+                    )
+                }
+                Err(e) => {
+                    format!("Error: {}", e)
+                }
+            };
+            let result_dialog = adw::MessageDialog::new(
+                parent.as_ref(),
+                Some("Uninstall Result"),
+                Some(&body_text),
+            );
+            result_dialog.add_response("ok", "OK");
+            result_dialog.set_close_response("ok");
+            result_dialog.connect_response(None, |rd, _| rd.close());
+            result_dialog.present();
+        } else {
+            d.close();
+        }
+    });
+
+    dialog.present();
 }
 
 fn add_row(grid: &gtk::Grid, row: i32, label: &str, value: &str) {

@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use crate::adapters::{AdapterError, PackageAdapter};
 use crate::models::{
     AppFootprint, DependencyInfo, DependencyType, InstallScope, IntegrityStatus, PackageSource,
-    SizeBreakdown, SystemPath, UninstallOptions, UninstallPlan, UninstallResult,
+    ProcessInfo, SizeBreakdown, StageType, SystemPath, UninstallOptions, UninstallPlan,
+    UninstallResult, UninstallStage, UninstallWarning,
 };
 
 pub struct FlatpakAdapter;
@@ -119,6 +120,54 @@ impl FlatpakAdapter {
             total_footprint,
             ..Default::default()
         }
+    }
+
+    async fn flatpak_size(app_id: &str) -> u64 {
+        Self::flatpak_output(&["info", "--show-size", app_id])
+            .await
+            .ok()
+            .and_then(|lines| lines.first().and_then(|s| s.trim().parse::<u64>().ok()))
+            .unwrap_or(0)
+    }
+
+    fn flatpak_var_data(app_id: &str) -> String {
+        format!(
+            "{}/.var/app/{}",
+            std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
+            app_id
+        )
+    }
+
+    async fn is_process_running(binary_hint: &str) -> Vec<ProcessInfo> {
+        let Ok(mut entries) = tokio::fs::read_dir("/proc").await else {
+            return Vec::new();
+        };
+        let hint_lower = binary_hint.to_lowercase();
+        let mut processes = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let pid_str = entry.file_name().to_string_lossy().to_string();
+            let pid: u32 = match pid_str.parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let cmdline_path = format!("/proc/{}/cmdline", pid_str);
+            if let Ok(cmd) = tokio::fs::read_to_string(&cmdline_path).await {
+                if cmd.to_lowercase().contains(&hint_lower) {
+                    let name = std::path::Path::new(&cmd.split('\0').next().unwrap_or(""))
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    processes.push(ProcessInfo {
+                        pid,
+                        name,
+                        cmdline: cmd.replace('\0', " "),
+                        memory_bytes: 0,
+                    });
+                }
+            }
+        }
+        processes
     }
 }
 
@@ -375,21 +424,139 @@ impl PackageAdapter for FlatpakAdapter {
 
     async fn plan_uninstall(
         &self,
-        _app_id: &str,
+        app_id: &str,
         _options: UninstallOptions,
     ) -> Result<UninstallPlan, AdapterError> {
-        Err(AdapterError::NotAvailable(
-            "uninstall planning not implemented yet".into(),
-        ))
+        let fp_id = app_id.strip_prefix("flatpak:").unwrap_or(app_id);
+
+        // Verify app exists
+        let info = Self::flatpak_output(&["info", fp_id]).await?;
+        let info_line = info.first().ok_or_else(|| AdapterError::AppNotFound(fp_id.to_string()))?;
+
+        let display_name = info_line.trim().split(" - ").next().unwrap_or(fp_id).to_string();
+
+        // Get the runtime dependency
+        let runtime = Self::flatpak_output(&["info", "--show-runtime", fp_id])
+            .await
+            .ok()
+            .and_then(|l| l.first().cloned())
+            .unwrap_or_default();
+
+        let size = Self::flatpak_size(fp_id).await;
+
+        let data_dir = Self::flatpak_var_data(fp_id);
+        let has_data = std::path::Path::new(&data_dir).exists();
+
+        let mut stages = Vec::new();
+
+        stages.push(UninstallStage {
+            stage_type: StageType::RemovePackage,
+            description: format!("Remove Flatpak app '{}' (size: {})", display_name, size),
+            items: vec![fp_id.to_string()],
+            requires_root: false,
+            reversible: false,
+        });
+
+        if has_data {
+            stages.push(UninstallStage {
+                stage_type: StageType::RemoveData,
+                description: format!("Remove user data at {}", data_dir),
+                items: vec![data_dir.clone()],
+                requires_root: false,
+                reversible: true,
+            });
+        }
+
+        let mut warnings = Vec::new();
+        if !runtime.is_empty() {
+            warnings.push(UninstallWarning::SharedDependencies(vec![runtime]));
+        }
+        let procs = Self::is_process_running(fp_id).await;
+        if !procs.is_empty() {
+            warnings.push(UninstallWarning::RunningProcesses(procs));
+        }
+
+        Ok(UninstallPlan {
+            app_id: app_id.to_string(),
+            app_name: display_name,
+            stages,
+            total_space_to_free: size,
+            warnings,
+            backup_recommendation: None,
+        })
     }
 
     async fn execute_uninstall(
         &self,
-        _plan: &UninstallPlan,
+        plan: &UninstallPlan,
         _cancel: CancellationToken,
     ) -> Result<UninstallResult, AdapterError> {
-        Err(AdapterError::NotAvailable(
-            "uninstall execution not implemented yet".into(),
-        ))
+        let fp_id = plan.app_id.strip_prefix("flatpak:").unwrap_or(&plan.app_id);
+
+        // Determine if it's a system or user install
+        let system_path = format!("/var/lib/flatpak/app/{}", fp_id);
+        let is_system = std::path::Path::new(&system_path).exists();
+
+        let mut args = vec!["uninstall", "-y", "--noninteractive"];
+        if is_system {
+            args.push("--system");
+        }
+        args.push(fp_id);
+
+        let output = Command::new("flatpak")
+            .args(&args)
+            .output()
+            .await?;
+
+        if output.status.success() {
+            // Try to clean up user data directory
+            let data_dir = Self::flatpak_var_data(fp_id);
+            if std::path::Path::new(&data_dir).exists() {
+                let _ = tokio::fs::remove_dir_all(&data_dir).await;
+            }
+
+            Ok(UninstallResult {
+                app_id: plan.app_id.clone(),
+                success: true,
+                stages_completed: vec![StageType::RemovePackage],
+                stages_failed: Vec::new(),
+                space_freed: plan.total_space_to_free,
+                backup_path: None,
+                error_message: None,
+            })
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let err_msg = stderr.trim().to_string();
+
+            // If permission denied, try with pkexec
+            if err_msg.contains("permission") || err_msg.contains("denied") || err_msg.contains("root") {
+                let pkexec_output = Command::new("pkexec")
+                    .args(&["flatpak", "uninstall", "-y", "--noninteractive", fp_id])
+                    .output()
+                    .await?;
+
+                if pkexec_output.status.success() {
+                    return Ok(UninstallResult {
+                        app_id: plan.app_id.clone(),
+                        success: true,
+                        stages_completed: vec![StageType::RemovePackage],
+                        stages_failed: Vec::new(),
+                        space_freed: plan.total_space_to_free,
+                        backup_path: None,
+                        error_message: None,
+                    });
+                }
+            }
+
+            Ok(UninstallResult {
+                app_id: plan.app_id.clone(),
+                success: false,
+                stages_completed: Vec::new(),
+                stages_failed: vec![StageType::RemovePackage],
+                space_freed: 0,
+                backup_path: None,
+                error_message: Some(err_msg),
+            })
+        }
     }
 }
