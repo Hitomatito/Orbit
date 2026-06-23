@@ -59,10 +59,12 @@ impl OrbitApp {
             .build();
 
         let nav = adw::NavigationView::new();
-        let list_page = build_list_page(state);
+        let list_page = build_list_page(state.clone());
         nav.push(&list_page);
 
         NAV_VIEW.with(|n| *n.borrow_mut() = Some(nav.clone()));
+
+        load_cached_apps(state);
 
         window.set_content(Some(&nav));
         window.present();
@@ -249,20 +251,7 @@ fn build_list_page(state: Arc<SharedState>) -> adw::NavigationPage {
                         apps.iter().map(|a| a.id.clone()).collect()
                     };
 
-                    APP_STORE.with(|s| {
-                        if let Some(ref store) = *s.borrow() {
-                            store.remove_all();
-                            for id in &ids {
-                                store.append(&gtk::StringObject::new(id));
-                            }
-                        }
-                    });
-                    SCAN_BTN.with(|b| {
-                        if let Some(ref btn) = *b.borrow() {
-                            btn.set_sensitive(true);
-                            btn.set_label(&format!("Scan ({} apps)", total));
-                        }
-                    });
+                    populate_store(&ids, total);
                     SCAN_SPINNER.with(|s| {
                         if let Some(ref sp) = *s.borrow() {
                             sp.stop();
@@ -278,6 +267,31 @@ fn build_list_page(state: Arc<SharedState>) -> adw::NavigationPage {
         .title("Orbit")
         .child(&toolbar)
         .build()
+}
+
+fn populate_store(ids: &[String], total: usize) {
+    APP_STORE.with(|s| {
+        if let Some(ref store) = *s.borrow() {
+            store.remove_all();
+            for id in ids {
+                store.append(&gtk::StringObject::new(id));
+            }
+        }
+    });
+    SCAN_BTN.with(|b| {
+        if let Some(ref btn) = *b.borrow() {
+            btn.set_sensitive(true);
+            btn.set_label(&format!("Scan ({} apps)", total));
+        }
+    });
+}
+
+fn load_cached_apps(state: Arc<SharedState>) {
+    let apps = state.discovery.get_cached_apps();
+    let total = apps.len();
+    let ids: Vec<String> = apps.iter().map(|a| a.id.clone()).collect();
+    *state.apps.lock().unwrap() = apps;
+    populate_store(&ids, total);
 }
 
 fn show_detail_page(app: AppFootprint, _state: &Arc<SharedState>) {
