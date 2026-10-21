@@ -69,7 +69,7 @@ Nota: las operaciones que modifican el sistema solicitarán elevación vía Polk
 
  ## Licencia
 
- (Especificar la licencia: MIT/Apache-2.0). Añadir `LICENSE` al repositorio.
+ MIT. Consulta [LICENSE](LICENSE).
 
  ## Referencias
 
